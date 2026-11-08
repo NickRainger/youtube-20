@@ -44,7 +44,8 @@ export default defineConfig({
 				},
 				generateSW: {
 					navigateFallback: '/',
-					globPatterns: ['**/*.{js,css,html,ico,png,svg,woff2}']
+					globStrict: false,
+					globPatterns: ['client/**/*.{js,css,ico,png,svg,webp,webmanifest}', 'prerendered/**/*.{html,json}']
 				},
 				devOptions: { enabled: true }
 			}

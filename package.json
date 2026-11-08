@@ -23,6 +23,7 @@
 		"@types/node": "^22",
 		"@vite-pwa/sveltekit": "^2.0.1",
 		"daisyui": "^5.7.50",
+		"magicast": "^0.5.5",
 		"svelte": "^5.57.2",
 		"svelte-check": "^4.6.0",
 		"tailwindcss": "^4.3.0",
