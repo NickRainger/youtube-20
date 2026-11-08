@@ -1,6 +1,6 @@
 import tailwindcss from '@tailwindcss/vite';
 import { withPwa } from '@vite-pwa/sveltekit';
-import adapter from '@sveltejs/adapter-node';
+import adapter from '@sveltejs/adapter-vercel';
 import { defineConfig } from 'vite';
 
 export default defineConfig({
@@ -45,7 +45,10 @@ export default defineConfig({
 				generateSW: {
 					navigateFallback: '/',
 					globStrict: false,
-					globPatterns: ['client/**/*.{js,css,ico,png,svg,webp,webmanifest}', 'prerendered/**/*.{html,json}']
+					globPatterns: [
+						'client/**/*.{js,css,ico,png,svg,webp,webmanifest}',
+						'prerendered/**/*.{html,json}'
+					]
 				},
 				devOptions: { enabled: true }
 			}
