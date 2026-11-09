@@ -23,6 +23,28 @@
 	const lang = $derived(getLibrary().lang);
 	const id = $derived(page.params.id);
 
+	async function resolveStream(videoId: string) {
+		// Race same-origin (Piped via our API) with direct browser Piped/Invidious.
+		// Piped proxy MP4s are not viewer-IP bound; Invidious HLS is skipped (googlevideo 403).
+		const apiP = fetch(`/api/stream/${videoId}`)
+			.then(async (r) => {
+				if (!r.ok) throw new Error(`api ${r.status}`);
+				const data = await r.json();
+				if (!data.streamUrl) throw new Error('api empty');
+				return {
+					streamUrl: data.streamUrl as string,
+					qualities: (data.qualities as { label: string; url: string }[]) ?? [],
+					meta: undefined as undefined
+				};
+			});
+		const clientP = resolveStreamClient(videoId).then((client) => ({
+			streamUrl: client.streamUrl as string,
+			qualities: client.qualities,
+			meta: client.meta
+		}));
+		return Promise.any([apiP, clientP]);
+	}
+
 	$effect(() => {
 		const videoId = id;
 		if (!videoId) return;
@@ -35,12 +57,11 @@
 
 		(async () => {
 			try {
-				// Metadata via our API (server Invidious) + streams via browser (local=true)
 				const [metaRes, stream, c] = await Promise.all([
 					fetch(`/api/videos/${videoId}`)
 						.then(async (r) => (r.ok ? r.json() : null))
 						.catch(() => null),
-					resolveStreamClient(videoId),
+					resolveStream(videoId),
 					fetch(`/api/comments/${videoId}`)
 						.then((r) => r.json())
 						.catch(() => ({ comments: [] }))
@@ -68,7 +89,7 @@
 							: stream.meta?.recommendedVideos) ?? []
 				};
 				streamUrl = stream.streamUrl;
-				qualities = stream.qualities;
+				qualities = stream.qualities ?? [];
 				comments = c.comments ?? [];
 				addHistory({
 					videoId: video.videoId,
@@ -96,7 +117,7 @@
 	<div class="skeleton aspect-video w-full rounded-none lg:mx-auto lg:mt-4 lg:max-w-6xl lg:rounded-2xl"></div>
 {/if}
 
-{#if errorMsg}
+{#if errorMsg && !video}
 	<div class="mx-auto max-w-6xl p-4">
 		<div class="alert alert-error whitespace-pre-wrap text-sm">{errorMsg}</div>
 	</div>
@@ -114,6 +135,11 @@
 					{lang}
 				/>
 			</div>
+			{#if errorMsg && !streamUrl}
+				<div class="px-4 pt-2 lg:px-0">
+					<div class="alert alert-warning whitespace-pre-wrap text-sm">{errorMsg}</div>
+				</div>
+			{/if}
 			<div class="px-4 pt-4 lg:px-0">
 				<h1 class="font-display text-xl font-bold sm:text-2xl">{video.title}</h1>
 				<p class="mt-1 text-sm opacity-55">

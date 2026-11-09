@@ -10,7 +10,8 @@ export const INVIDIOUS = [
 export const PIPED = [
 	'https://api.piped.private.coffee',
 	'https://pipedapi.ducks.party',
-	'https://pipedapi.kavin.rocks',
 	'https://pipedapi.adminforge.de',
-	'https://pipedapi.nosebs.ru'
+	'https://pipedapi.nosebs.ru',
+	'https://pipedapi.reallyaweso.me',
+	'https://pipedapi.kavin.rocks'
 ];

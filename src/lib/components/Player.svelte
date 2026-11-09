@@ -34,13 +34,15 @@
 	let lastTapX = 0;
 	let hls: HlsType | null = null;
 	let attachGen = 0;
+	let mediaError = $state('');
 
 	function looksLikeHls(url: string) {
-		return /m3u8|hls_variant|\/hls[/_]/i.test(url);
+		return /m3u8|hls_variant|\/hls[/_]|\.m3u8/i.test(url);
 	}
 
 	$effect(() => {
 		activeSrc = src;
+		mediaError = '';
 	});
 
 	$effect(() => {
@@ -59,6 +61,7 @@
 		async function attach() {
 			if (!el || !url || cancelled || gen !== attachGen) return;
 			buffering = true;
+			mediaError = '';
 			try {
 				if (looksLikeHls(url)) {
 					const native = el.canPlayType('application/vnd.apple.mpegurl');
@@ -74,16 +77,42 @@
 							});
 							hls = instance;
 							instance.on(Hls.Events.ERROR, (_e, data) => {
-								if (data.fatal) buffering = false;
+								if (data.fatal) {
+									buffering = false;
+									mediaError = 'Stream error';
+								}
 							});
 							instance.loadSource(url);
 							instance.attachMedia(el);
+							await new Promise<void>((resolve) => {
+								instance.once(Hls.Events.MANIFEST_PARSED, () => resolve());
+								instance.once(Hls.Events.ERROR, (_ev, data) => {
+									if (data.fatal) resolve();
+								});
+							});
 						} else {
 							el.src = url;
 						}
 					}
 				} else {
 					el.src = url;
+					await new Promise<void>((resolve) => {
+						const ok = () => {
+							cleanup();
+							resolve();
+						};
+						const fail = () => {
+							cleanup();
+							mediaError = 'Stream error';
+							resolve();
+						};
+						const cleanup = () => {
+							el.removeEventListener('loadeddata', ok);
+							el.removeEventListener('error', fail);
+						};
+						el.addEventListener('loadeddata', ok, { once: true });
+						el.addEventListener('error', fail, { once: true });
+					});
 				}
 				if (cancelled || gen !== attachGen) return;
 				await el.play().catch(() => {});
@@ -216,6 +245,12 @@
 
 	{#if buffering && activeSrc}
 		<div class="yt-spinner" aria-hidden="true"></div>
+	{/if}
+
+	{#if mediaError && activeSrc}
+		<div class="yt-player-empty" style="background:transparent">
+			<p>{mediaError}</p>
+		</div>
 	{/if}
 
 	{#if flash}

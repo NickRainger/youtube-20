@@ -1,6 +1,11 @@
 import { json, error } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
-import { getVideo, isHlsUrl, pickProgressiveStream } from '#lib/server/proxy';
+import {
+	getVideo,
+	isHlsUrl,
+	pickProgressiveStream,
+	resolvePlayableStream
+} from '#lib/server/proxy';
 import { isShortsCandidate } from '#lib/server/shorts';
 
 export const GET: RequestHandler = async ({ params }) => {
@@ -9,24 +14,36 @@ export const GET: RequestHandler = async ({ params }) => {
 		if (isShortsCandidate(video)) {
 			error(404, 'Shorts are disabled in YouTube 2.0');
 		}
-		const streamUrl = pickProgressiveStream(video);
-		const qualities = (video.formatStreams ?? [])
+
+		let streamUrl = pickProgressiveStream(video);
+		let qualities = (video.formatStreams ?? [])
 			.map((s) => ({
 				label: s.qualityLabel || s.resolution || 'auto',
 				url: s.url,
 				container: s.container
 			}))
-			.filter((q) => q.url);
-		if (streamUrl && isHlsUrl(streamUrl) && !qualities.some((q) => q.url === streamUrl)) {
-			qualities.unshift({ label: 'HLS', url: streamUrl, container: 'hls' });
+			.filter((q) => q.url && !isHlsUrl(q.url));
+		let source = 'invidious-progressive';
+
+		if (!streamUrl) {
+			try {
+				const resolved = await resolvePlayableStream(params.id);
+				streamUrl = resolved.streamUrl;
+				qualities = resolved.qualities.map((q) => ({ ...q, container: 'mp4' }));
+				source = resolved.source;
+			} catch {
+				/* metadata still useful without a stream */
+			}
 		}
+
 		return json({
 			video,
 			streamUrl,
 			qualities,
 			hls: isHlsUrl(streamUrl),
+			source,
 			corsNote:
-				'Progressive streams play cross-origin in <video> without CORS. HLS falls back when muxed MP4 is unavailable.'
+				'Prefer Piped muxed MP4 via proxy. Invidious HLS nested googlevideo URLs are not returned.'
 		});
 	} catch (e) {
 		error(502, e instanceof Error ? e.message : 'video failed');

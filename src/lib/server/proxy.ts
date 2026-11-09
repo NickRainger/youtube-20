@@ -293,9 +293,23 @@ export async function getChannelVideos(id: string, opts?: FetchOpts): Promise<Vi
 	}
 }
 
+function isUnreliableMediaHost(url: string) {
+	try {
+		const host = new URL(url).hostname;
+		return /(^|\.)odycdn\.com$/i.test(host) || /(^|\.)lbry\.tv$/i.test(host);
+	} catch {
+		return true;
+	}
+}
+
 export function pickProgressiveStream(video: VideoDetail): string | null {
 	const streams = (video.formatStreams ?? []).filter(
-		(s) => s.container !== 'hls' && !String(s.type).toLowerCase().includes('mpegurl')
+		(s) =>
+			s.url &&
+			!isUnreliableMediaHost(s.url) &&
+			s.container !== 'hls' &&
+			!String(s.type).toLowerCase().includes('mpegurl') &&
+			!isHlsUrl(s.url)
 	);
 	if (streams.length) {
 		const mp4 = streams.filter((s) => s.container === 'mp4' || s.type?.includes('mp4'));
@@ -307,9 +321,88 @@ export function pickProgressiveStream(video: VideoDetail): string | null {
 		});
 		return sorted[0]?.url ?? null;
 	}
-	// Many public instances no longer expose muxed progressive URLs — HLS still works.
-	if (video.hlsUrl) return video.hlsUrl;
-	return video.formatStreams?.[0]?.url ?? null;
+	// Do NOT fall back to Invidious HLS here: child playlists still hit googlevideo
+	// with the instance IP and 403 in browsers.
+	return null;
+}
+
+/** Piped-first playable muxed MP4 (proxy URLs work from any viewer IP). */
+export async function resolvePlayableStream(
+	id: string,
+	opts?: FetchOpts
+): Promise<{
+	streamUrl: string;
+	qualities: { label: string; url: string }[];
+	hls: boolean;
+	source: string;
+}> {
+	const errors: string[] = [];
+
+	for (const instance of PIPED) {
+		try {
+			const data = await fetchJson<Record<string, unknown>>(
+				`${instance}/streams/${encodeURIComponent(id)}`,
+				opts
+			);
+			if ((data as { error?: string }).error) {
+				throw new Error(String((data as { error?: string }).error));
+			}
+			const streams = ((data.videoStreams as Record<string, unknown>[]) ?? []).filter((s) => {
+				if (s.videoOnly) return false;
+				const url = String(s.url ?? '');
+				if (!url || isUnreliableMediaHost(url)) return false;
+				const format = String(s.format ?? s.mimeType ?? '').toLowerCase();
+				if (format.includes('hls') || isHlsUrl(url)) return false;
+				return true;
+			});
+			const qualities = streams
+				.map((s) => ({
+					label: String(s.quality ?? s.qualityLabel ?? 'auto'),
+					url: String(s.url)
+				}))
+				.sort((a, b) => {
+					const qa = parseInt(a.label, 10) || 0;
+					const qb = parseInt(b.label, 10) || 0;
+					return qb - qa;
+				});
+			if (!qualities.length) {
+				errors.push(`${instance}: no muxed progressive`);
+				continue;
+			}
+			return {
+				streamUrl: qualities[0].url,
+				qualities,
+				hls: false,
+				source: `piped:${instance}`
+			};
+		} catch (e) {
+			errors.push(`${instance}: ${e instanceof Error ? e.message : String(e)}`);
+		}
+	}
+
+	try {
+		const video = await getVideo(id, opts);
+		const streamUrl = pickProgressiveStream(video);
+		if (streamUrl) {
+			const qualities = (video.formatStreams ?? [])
+				.filter((s) => s.url && !isHlsUrl(s.url) && !isUnreliableMediaHost(s.url))
+				.map((s) => ({
+					label: s.qualityLabel || s.resolution || 'auto',
+					url: s.url
+				}));
+			return {
+				streamUrl,
+				qualities: qualities.length ? qualities : [{ label: 'auto', url: streamUrl }],
+				hls: false,
+				source: 'invidious-progressive'
+			};
+		}
+		errors.push('invidious: no progressive');
+	} catch (e) {
+		errors.push(`invidious: ${e instanceof Error ? e.message : String(e)}`);
+	}
+
+	throw new Error(`No playable stream:\n${errors.join('\n')}`);
 }
 
 export function isHlsUrl(url: string | null | undefined): boolean {
