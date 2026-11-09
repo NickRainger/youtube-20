@@ -1,31 +1,30 @@
-/** Resolve a browser-playable progressive URL.
+/** Browser fallback for progressive URLs.
+ *
+ * Prefer same-origin `/api/stream` (server races Piped/Invidious without CORS).
+ * This client path only hits Piped hosts known to send ACAO: * — public Invidious
+ * instances are CORS-hostile and must not be called from the browser.
  *
  * Invidious HLS/`local=true` manifests still point at googlevideo.com with the
- * instance IP → 403 / CORS in the browser. Piped muxed streams via the Piped
- * proxy are signed for the proxy and play cross-origin with CORS *.
+ * instance IP → 403 / CORS. Piped muxed streams via the Piped proxy are signed
+ * for the proxy and play cross-origin with CORS *.
  */
 
-export const STREAM_PIPED = [
-	'https://api.piped.private.coffee',
-	'https://pipedapi.ducks.party',
-	'https://pipedapi.adminforge.de',
-	'https://pipedapi.nosebs.ru',
-	'https://pipedapi.reallyaweso.me'
-];
+import { PIPED_CORS_FRIENDLY } from '#lib/instances';
+import {
+	StreamResolveError,
+	classifyUpstreamMessage,
+	toStreamResolveError
+} from '#lib/stream-errors';
 
-export const STREAM_INVIDIOUS = [
-	'https://yt.chocolatemoo53.com',
-	'https://invidious.materialio.us',
-	'https://yewtu.be',
-	'https://inv.nadeko.net',
-	'https://invidious.nerdvpn.de'
-];
+/** Re-export for callers that still import from stream.ts */
+export const STREAM_PIPED = PIPED_CORS_FRIENDLY;
 
 export type ResolvedStream = {
 	streamUrl: string | null;
 	hls: boolean;
 	qualities: { label: string; url: string }[];
 	source?: string;
+	code?: string;
 	meta?: {
 		title?: string;
 		author?: string;
@@ -88,58 +87,6 @@ function pickPipedMuxed(data: Record<string, unknown>): {
 	};
 }
 
-function pickInvidiousProgressive(data: Record<string, unknown>): {
-	streamUrl: string | null;
-	qualities: { label: string; url: string }[];
-} {
-	const formatStreams =
-		(data.formatStreams as {
-			url?: string;
-			qualityLabel?: string;
-			resolution?: string;
-			container?: string;
-			type?: string;
-		}[]) ?? [];
-	const progressive = formatStreams.filter((s) => {
-		if (!s.url || isUnreliableHost(s.url)) return false;
-		if (s.container === 'hls') return false;
-		if (String(s.type || '').toLowerCase().includes('mpegurl')) return false;
-		if (isHls(s.url)) return false;
-		return true;
-	});
-	const qualities = progressive
-		.map((s) => ({
-			label: s.qualityLabel || s.resolution || 'auto',
-			url: String(s.url)
-		}))
-		.sort((a, b) => qualityScore(b.label) - qualityScore(a.label));
-	if (!qualities.length) return { streamUrl: null, qualities: [] };
-	const mp4 = qualities.filter((q) => /\.mp4|mime=video%2Fmp4|\/mp4/i.test(q.url) || true);
-	return { streamUrl: mp4[0]?.url ?? qualities[0].url, qualities };
-}
-
-function metaFromInvidious(videoId: string, data: Record<string, unknown>): ResolvedStream['meta'] {
-	return {
-		videoId,
-		title: String(data.title ?? ''),
-		author: String(data.author ?? ''),
-		authorId: String(data.authorId ?? ''),
-		description: String(data.description ?? ''),
-		descriptionHtml: data.descriptionHtml ? String(data.descriptionHtml) : undefined,
-		viewCount: Number(data.viewCount ?? 0),
-		publishedText: String(data.publishedText ?? ''),
-		lengthSeconds: Number(data.lengthSeconds ?? 0),
-		videoThumbnails: data.videoThumbnails as ResolvedStream['meta'] extends infer M
-			? M extends { videoThumbnails?: infer T }
-				? T
-				: never
-			: never,
-		authorThumbnails: data.authorThumbnails as never,
-		subCountText: data.subCountText ? String(data.subCountText) : undefined,
-		recommendedVideos: (data.recommendedVideos as unknown[]) ?? []
-	};
-}
-
 function metaFromPiped(videoId: string, data: Record<string, unknown>): ResolvedStream['meta'] {
 	const thumb = String(data.thumbnailUrl ?? data.thumbnail ?? '');
 	return {
@@ -164,55 +111,59 @@ function metaFromPiped(videoId: string, data: Record<string, unknown>): Resolved
 
 async function fetchJson(url: string): Promise<Record<string, unknown>> {
 	const res = await fetch(url, { headers: { Accept: 'application/json' } });
-	if (!res.ok) throw new Error(`HTTP ${res.status}`);
-	const data = (await res.json()) as Record<string, unknown> | string;
-	if (typeof data === 'string') throw new Error(data);
-	if (data.error) throw new Error(String(data.error));
+	const text = await res.text();
+	let data: Record<string, unknown> | string | null = null;
+	try {
+		data = text ? (JSON.parse(text) as Record<string, unknown> | string) : null;
+	} catch {
+		data = null;
+	}
+	if (!res.ok) {
+		const detail =
+			data && typeof data === 'object' && data.error
+				? String(data.error)
+				: `HTTP ${res.status}`;
+		throw new StreamResolveError(classifyUpstreamMessage(detail), detail, detail);
+	}
+	if (typeof data === 'string') {
+		throw new StreamResolveError(classifyUpstreamMessage(data), data, data);
+	}
+	if (!data || typeof data !== 'object') {
+		throw new StreamResolveError('no_stream', 'empty response');
+	}
+	if (data.error) {
+		const detail = String(data.error);
+		throw new StreamResolveError(classifyUpstreamMessage(detail), detail, detail);
+	}
 	return data;
 }
 
+/** Race CORS-friendly Piped mirrors only (browser-safe). */
 export async function resolveStreamClient(videoId: string): Promise<ResolvedStream> {
 	const errors: string[] = [];
 
-	for (const instance of STREAM_PIPED) {
-		try {
-			const data = await fetchJson(`${instance}/streams/${encodeURIComponent(videoId)}`);
-			const picked = pickPipedMuxed(data);
-			if (!picked.streamUrl) {
-				errors.push(`${instance}: no muxed progressive`);
-				continue;
-			}
-			return {
-				...picked,
-				hls: false,
-				source: `piped:${instance}`,
-				meta: metaFromPiped(videoId, data)
-			};
-		} catch (e) {
-			errors.push(`${instance}: ${e instanceof Error ? e.message : String(e)}`);
+	const tasks = STREAM_PIPED.map(async (instance) => {
+		const data = await fetchJson(`${instance}/streams/${encodeURIComponent(videoId)}`);
+		const picked = pickPipedMuxed(data);
+		if (!picked.streamUrl) {
+			throw new Error(`${instance}: no muxed progressive`);
 		}
-	}
+		return {
+			...picked,
+			hls: false,
+			source: `piped-client:${instance}`,
+			meta: metaFromPiped(videoId, data)
+		} satisfies ResolvedStream;
+	});
 
-	for (const instance of STREAM_INVIDIOUS) {
-		try {
-			const data = await fetchJson(
-				`${instance}/api/v1/videos/${encodeURIComponent(videoId)}?local=true`
-			);
-			const picked = pickInvidiousProgressive(data);
-			if (!picked.streamUrl) {
-				errors.push(`${instance}: no progressive (HLS-only skipped — googlevideo 403)`);
-				continue;
-			}
-			return {
-				...picked,
-				hls: isHls(picked.streamUrl),
-				source: `invidious:${instance}`,
-				meta: metaFromInvidious(videoId, data)
-			};
-		} catch (e) {
-			errors.push(`${instance}: ${e instanceof Error ? e.message : String(e)}`);
-		}
+	try {
+		return await Promise.any(tasks);
+	} catch (e) {
+		const wrapped = toStreamResolveError(e, errors.join('\n'));
+		throw new StreamResolveError(
+			wrapped.code,
+			wrapped.message,
+			wrapped.details || `No playable stream from CORS-friendly Piped mirrors`
+		);
 	}
-
-	throw new Error(`No playable stream:\n${errors.join('\n')}`);
 }

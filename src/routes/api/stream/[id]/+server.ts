@@ -1,19 +1,12 @@
-import { json, error } from '@sveltejs/kit';
+import { json } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
-import { getVideo, resolvePlayableStream } from '#lib/server/proxy';
-import { isShortsCandidate } from '#lib/server/shorts';
+import { resolvePlayableStream, StreamResolveError } from '#lib/server/proxy';
+import { toStreamResolveError } from '#lib/stream-errors';
 
 export const GET: RequestHandler = async ({ params }) => {
 	try {
-		try {
-			const video = await getVideo(params.id);
-			if (isShortsCandidate(video)) {
-				error(404, 'Shorts are disabled in YouTube 2.0');
-			}
-		} catch {
-			/* Piped may still resolve the stream */
-		}
-
+		// Skip blocking getVideo/shorts probe here — listings already filter Shorts,
+		// and a full metadata crawl was delaying stream failover by tens of seconds.
 		const resolved = await resolvePlayableStream(params.id);
 		return json({
 			...resolved,
@@ -21,6 +14,18 @@ export const GET: RequestHandler = async ({ params }) => {
 				'Piped proxy muxed MP4 is preferred. Invidious HLS is skipped because nested googlevideo URLs 403 in browsers.'
 		});
 	} catch (e) {
-		error(502, e instanceof Error ? e.message : 'stream failed');
+		const err = e instanceof StreamResolveError ? e : toStreamResolveError(e);
+		const status = err.code === 'unavailable' ? 404 : 502;
+		return json(
+			{
+				streamUrl: null,
+				qualities: [],
+				hls: false,
+				code: err.code,
+				message: err.message,
+				details: err.details
+			},
+			{ status }
+		);
 	}
 };
