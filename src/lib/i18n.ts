@@ -42,6 +42,13 @@ const dict = {
 		subscribers: 'abonnees',
 		errorLoad: 'Kon gegevens niet laden',
 		noStream: 'Geen speelbare stream via privacy-frontends.',
+		streamUnavailable:
+			'Deze video is niet beschikbaar (verwijderd, privé of geblokkeerd).',
+		streamBotBlock:
+			'Privacy-servers worden tijdelijk geblokkeerd door YouTube. Probeer het zo opnieuw.',
+		streamTemporary:
+			'Afspelen lukt nu niet via de privacy-servers. Metadata blijft zichtbaar — tik op Opnieuw.',
+		streamRetry: 'Opnieuw proberen',
 		lock: 'Vergrendel',
 		unlock: 'Ontgrendel',
 		quality: 'Kwaliteit',
@@ -99,6 +106,13 @@ const dict = {
 		subscribers: 'subscribers',
 		errorLoad: 'Could not load data',
 		noStream: 'No playable stream from privacy frontends.',
+		streamUnavailable:
+			'This video is unavailable (removed, private, or blocked).',
+		streamBotBlock:
+			'Privacy frontends are temporarily blocked by YouTube. Try again in a moment.',
+		streamTemporary:
+			'Playback is unavailable from privacy frontends right now. Metadata stays visible — tap Retry.',
+		streamRetry: 'Retry',
 		lock: 'Lock',
 		unlock: 'Unlock',
 		quality: 'Quality',

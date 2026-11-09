@@ -1,18 +1,30 @@
-/** Browser-side stream resolve — Invidious signs URLs for the request path;
- *  fetching from the phone/desktop (not the Vercel datacenter) is required. */
+/** Browser fallback for progressive URLs.
+ *
+ * Prefer same-origin `/api/stream` (server races Piped/Invidious without CORS).
+ * This client path only hits Piped hosts known to send ACAO: * — public Invidious
+ * instances are CORS-hostile and must not be called from the browser.
+ *
+ * Invidious HLS/`local=true` manifests still point at googlevideo.com with the
+ * instance IP → 403 / CORS. Piped muxed streams via the Piped proxy are signed
+ * for the proxy and play cross-origin with CORS *.
+ */
 
-export const STREAM_INSTANCES = [
-	'https://yt.chocolatemoo53.com',
-	'https://invidious.materialio.us',
-	'https://yewtu.be',
-	'https://inv.nadeko.net',
-	'https://invidious.nerdvpn.de'
-];
+import { PIPED_CORS_FRIENDLY } from '#lib/instances';
+import {
+	StreamResolveError,
+	classifyUpstreamMessage,
+	toStreamResolveError
+} from '#lib/stream-errors';
+
+/** Re-export for callers that still import from stream.ts */
+export const STREAM_PIPED = PIPED_CORS_FRIENDLY;
 
 export type ResolvedStream = {
 	streamUrl: string | null;
 	hls: boolean;
 	qualities: { label: string; url: string }[];
+	source?: string;
+	code?: string;
 	meta?: {
 		title?: string;
 		author?: string;
@@ -31,89 +43,127 @@ export type ResolvedStream = {
 };
 
 function isHls(url: string) {
-	return /m3u8|hls_variant|\/hls[/_]/i.test(url);
+	return /m3u8|hls_variant|\/hls[/_]|\.m3u8/i.test(url);
 }
 
-function pickStream(data: Record<string, unknown>): {
+/** LBRY CDN often 401s without their player tokens — skip for <video>. */
+function isUnreliableHost(url: string) {
+	try {
+		const host = new URL(url).hostname;
+		return /(^|\.)odycdn\.com$/i.test(host) || /(^|\.)lbry\.tv$/i.test(host);
+	} catch {
+		return true;
+	}
+}
+
+function qualityScore(label: string) {
+	const n = parseInt(label, 10);
+	return Number.isFinite(n) ? n : 0;
+}
+
+function pickPipedMuxed(data: Record<string, unknown>): {
 	streamUrl: string | null;
 	qualities: { label: string; url: string }[];
 } {
-	const formatStreams = (data.formatStreams as { url?: string; qualityLabel?: string; resolution?: string; container?: string; type?: string }[]) ?? [];
-	const progressive = formatStreams.filter(
-		(s) => s.url && s.container !== 'hls' && !String(s.type || '').toLowerCase().includes('mpegurl')
-	);
-	const qualities = progressive.map((s) => ({
-		label: s.qualityLabel || s.resolution || 'auto',
-		url: String(s.url)
-	}));
-	if (progressive.length) {
-		const mp4 = progressive.filter((s) => s.container === 'mp4' || s.type?.includes('mp4'));
-		const pool = mp4.length ? mp4 : progressive;
-		const sorted = [...pool].sort((a, b) => {
-			const qa = parseInt(a.qualityLabel || a.resolution || '0', 10) || 0;
-			const qb = parseInt(b.qualityLabel || b.resolution || '0', 10) || 0;
-			return qb - qa;
-		});
-		return { streamUrl: String(sorted[0]?.url ?? null), qualities };
-	}
-	const hlsUrl = typeof data.hlsUrl === 'string' ? data.hlsUrl : null;
-	if (hlsUrl) {
-		return {
-			streamUrl: hlsUrl,
-			qualities: [{ label: 'HLS', url: hlsUrl }, ...qualities]
-		};
-	}
-	return { streamUrl: null, qualities };
+	const streams = ((data.videoStreams as Record<string, unknown>[]) ?? []).filter((s) => {
+		if (s.videoOnly) return false;
+		const url = String(s.url ?? '');
+		if (!url || isUnreliableHost(url)) return false;
+		const format = String(s.format ?? s.mimeType ?? '').toLowerCase();
+		if (format.includes('hls') || isHls(url)) return false;
+		return true;
+	});
+
+	const qualities = streams
+		.map((s) => ({
+			label: String(s.quality ?? s.qualityLabel ?? 'auto'),
+			url: String(s.url)
+		}))
+		.sort((a, b) => qualityScore(b.label) - qualityScore(a.label));
+
+	return {
+		streamUrl: qualities[0]?.url ?? null,
+		qualities
+	};
 }
 
+function metaFromPiped(videoId: string, data: Record<string, unknown>): ResolvedStream['meta'] {
+	const thumb = String(data.thumbnailUrl ?? data.thumbnail ?? '');
+	return {
+		videoId,
+		title: String(data.title ?? ''),
+		author: String(data.uploader ?? data.uploaderName ?? ''),
+		authorId: String(data.uploaderUrl ?? '').replace('/channel/', ''),
+		description: String(data.description ?? ''),
+		viewCount: Number(data.views ?? 0),
+		publishedText: String(data.uploadDate ?? data.uploadedDate ?? ''),
+		lengthSeconds: Number(data.duration ?? 0),
+		videoThumbnails: thumb ? [{ url: thumb, width: 720, height: 404 }] : [],
+		authorThumbnails: data.uploaderAvatar
+			? [{ url: String(data.uploaderAvatar), width: 88, height: 88 }]
+			: [],
+		subCountText: data.uploaderSubscriberCount
+			? String(data.uploaderSubscriberCount)
+			: undefined,
+		recommendedVideos: (data.relatedStreams as unknown[]) ?? []
+	};
+}
+
+async function fetchJson(url: string): Promise<Record<string, unknown>> {
+	const res = await fetch(url, { headers: { Accept: 'application/json' } });
+	const text = await res.text();
+	let data: Record<string, unknown> | string | null = null;
+	try {
+		data = text ? (JSON.parse(text) as Record<string, unknown> | string) : null;
+	} catch {
+		data = null;
+	}
+	if (!res.ok) {
+		const detail =
+			data && typeof data === 'object' && data.error
+				? String(data.error)
+				: `HTTP ${res.status}`;
+		throw new StreamResolveError(classifyUpstreamMessage(detail), detail, detail);
+	}
+	if (typeof data === 'string') {
+		throw new StreamResolveError(classifyUpstreamMessage(data), data, data);
+	}
+	if (!data || typeof data !== 'object') {
+		throw new StreamResolveError('no_stream', 'empty response');
+	}
+	if (data.error) {
+		const detail = String(data.error);
+		throw new StreamResolveError(classifyUpstreamMessage(detail), detail, detail);
+	}
+	return data;
+}
+
+/** Race CORS-friendly Piped mirrors only (browser-safe). */
 export async function resolveStreamClient(videoId: string): Promise<ResolvedStream> {
 	const errors: string[] = [];
-	for (const instance of STREAM_INSTANCES) {
-		try {
-			const res = await fetch(
-				`${instance}/api/v1/videos/${encodeURIComponent(videoId)}?local=true`,
-				{ headers: { Accept: 'application/json' } }
-			);
-			if (!res.ok) {
-				errors.push(`${instance}: HTTP ${res.status}`);
-				continue;
-			}
-			const data = (await res.json()) as Record<string, unknown>;
-			if (typeof data === 'string' || (data as { error?: string }).error) {
-				errors.push(`${instance}: ${String((data as { error?: string }).error || data)}`);
-				continue;
-			}
-			const picked = pickStream(data);
-			if (!picked.streamUrl) {
-				errors.push(`${instance}: no stream`);
-				continue;
-			}
-			return {
-				...picked,
-				hls: isHls(picked.streamUrl),
-				meta: {
-					videoId,
-					title: String(data.title ?? ''),
-					author: String(data.author ?? ''),
-					authorId: String(data.authorId ?? ''),
-					description: String(data.description ?? ''),
-					descriptionHtml: data.descriptionHtml ? String(data.descriptionHtml) : undefined,
-					viewCount: Number(data.viewCount ?? 0),
-					publishedText: String(data.publishedText ?? ''),
-					lengthSeconds: Number(data.lengthSeconds ?? 0),
-					videoThumbnails: data.videoThumbnails as ResolvedStream['meta'] extends infer M
-						? M extends { videoThumbnails?: infer T }
-							? T
-							: never
-						: never,
-					authorThumbnails: data.authorThumbnails as never,
-					subCountText: data.subCountText ? String(data.subCountText) : undefined,
-					recommendedVideos: (data.recommendedVideos as unknown[]) ?? []
-				}
-			};
-		} catch (e) {
-			errors.push(`${instance}: ${e instanceof Error ? e.message : String(e)}`);
+
+	const tasks = STREAM_PIPED.map(async (instance) => {
+		const data = await fetchJson(`${instance}/streams/${encodeURIComponent(videoId)}`);
+		const picked = pickPipedMuxed(data);
+		if (!picked.streamUrl) {
+			throw new Error(`${instance}: no muxed progressive`);
 		}
+		return {
+			...picked,
+			hls: false,
+			source: `piped-client:${instance}`,
+			meta: metaFromPiped(videoId, data)
+		} satisfies ResolvedStream;
+	});
+
+	try {
+		return await Promise.any(tasks);
+	} catch (e) {
+		const wrapped = toStreamResolveError(e, errors.join('\n'));
+		throw new StreamResolveError(
+			wrapped.code,
+			wrapped.message,
+			wrapped.details || `No playable stream from CORS-friendly Piped mirrors`
+		);
 	}
-	throw new Error(`No playable stream:\n${errors.join('\n')}`);
 }

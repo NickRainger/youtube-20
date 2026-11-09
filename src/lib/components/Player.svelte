@@ -20,6 +20,7 @@
 	} = $props();
 
 	let videoEl: HTMLVideoElement | undefined = $state();
+	let rootEl: HTMLDivElement | undefined = $state();
 	let showChrome = $state(true);
 	let locked = $state(false);
 	let playing = $state(false);
@@ -34,13 +35,22 @@
 	let lastTapX = 0;
 	let hls: HlsType | null = null;
 	let attachGen = 0;
+	let mediaError = $state('');
+	/** User explicitly paused — attach/effect must not call play() until they resume. */
+	let userPaused = false;
+	let cssFullscreen = $state(false);
+	let orientFsBusy = false;
 
 	function looksLikeHls(url: string) {
-		return /m3u8|hls_variant|\/hls[/_]/i.test(url);
+		return /m3u8|hls_variant|\/hls[/_]|\.m3u8/i.test(url);
 	}
 
 	$effect(() => {
-		activeSrc = src;
+		const next = src;
+		activeSrc = next;
+		mediaError = '';
+		// New stream → allow initial autoplay again.
+		userPaused = false;
 	});
 
 	$effect(() => {
@@ -55,10 +65,12 @@
 		if (!url) return;
 
 		let cancelled = false;
+		const shouldAutoplay = () => !cancelled && gen === attachGen && !userPaused;
 
 		async function attach() {
 			if (!el || !url || cancelled || gen !== attachGen) return;
 			buffering = true;
+			mediaError = '';
 			try {
 				if (looksLikeHls(url)) {
 					const native = el.canPlayType('application/vnd.apple.mpegurl');
@@ -74,18 +86,44 @@
 							});
 							hls = instance;
 							instance.on(Hls.Events.ERROR, (_e, data) => {
-								if (data.fatal) buffering = false;
+								if (data.fatal) {
+									buffering = false;
+									mediaError = 'Stream error';
+								}
 							});
 							instance.loadSource(url);
 							instance.attachMedia(el);
+							await new Promise<void>((resolve) => {
+								instance.once(Hls.Events.MANIFEST_PARSED, () => resolve());
+								instance.once(Hls.Events.ERROR, (_ev, data) => {
+									if (data.fatal) resolve();
+								});
+							});
 						} else {
 							el.src = url;
 						}
 					}
 				} else {
 					el.src = url;
+					await new Promise<void>((resolve) => {
+						const ok = () => {
+							cleanup();
+							resolve();
+						};
+						const fail = () => {
+							cleanup();
+							mediaError = 'Stream error';
+							resolve();
+						};
+						const cleanup = () => {
+							el.removeEventListener('loadeddata', ok);
+							el.removeEventListener('error', fail);
+						};
+						el.addEventListener('loadeddata', ok, { once: true });
+						el.addEventListener('error', fail, { once: true });
+					});
 				}
-				if (cancelled || gen !== attachGen) return;
+				if (!shouldAutoplay()) return;
 				await el.play().catch(() => {});
 			} finally {
 				if (gen === attachGen) buffering = false;
@@ -101,19 +139,186 @@
 		};
 	});
 
+	function isLandscape() {
+		if (typeof window === 'undefined') return false;
+		if (window.screen?.orientation?.type) {
+			return window.screen.orientation.type.startsWith('landscape');
+		}
+		if (typeof window.orientation === 'number') {
+			return Math.abs(window.orientation) === 90;
+		}
+		return window.matchMedia('(orientation: landscape)').matches;
+	}
+
+	function isCoarsePointerMobile() {
+		if (typeof window === 'undefined') return false;
+		return window.matchMedia('(hover: none) and (pointer: coarse)').matches;
+	}
+
+	function isNativeFullscreen() {
+		const doc = document as Document & {
+			webkitFullscreenElement?: Element | null;
+		};
+		const el = videoEl as (HTMLVideoElement & { webkitDisplayingFullscreen?: boolean }) | undefined;
+		return Boolean(
+			document.fullscreenElement ||
+				doc.webkitFullscreenElement ||
+				el?.webkitDisplayingFullscreen
+		);
+	}
+
+	/** CSS faux-fullscreen — works in browser tabs + PWA without a user gesture. */
+	function enterCssFullscreen() {
+		cssFullscreen = true;
+		try {
+			document.documentElement.classList.add('yt-fs-lock');
+			document.body.classList.add('yt-fs-lock');
+		} catch {
+			/* ignore */
+		}
+	}
+
+	function leaveCssFullscreen() {
+		cssFullscreen = false;
+		try {
+			document.documentElement.classList.remove('yt-fs-lock');
+			document.body.classList.remove('yt-fs-lock');
+		} catch {
+			/* ignore */
+		}
+	}
+
+	async function enterNativeFullscreen(): Promise<boolean> {
+		const el = videoEl;
+		const root = rootEl;
+		if (!el) return false;
+		try {
+			const anyEl = el as HTMLVideoElement & {
+				webkitEnterFullscreen?: () => void;
+			};
+			// iOS Safari: video-only FS; usually needs a user gesture.
+			if (typeof anyEl.webkitEnterFullscreen === 'function') {
+				anyEl.webkitEnterFullscreen();
+				await new Promise((r) => setTimeout(r, 80));
+				return isNativeFullscreen();
+			}
+			if (root?.requestFullscreen) {
+				await root.requestFullscreen();
+				return isNativeFullscreen();
+			}
+			const rootWebkit = root as (HTMLDivElement & { webkitRequestFullscreen?: () => void }) | undefined;
+			if (rootWebkit?.webkitRequestFullscreen) {
+				rootWebkit.webkitRequestFullscreen();
+				await new Promise((r) => setTimeout(r, 80));
+				return isNativeFullscreen();
+			}
+		} catch {
+			return false;
+		}
+		return false;
+	}
+
+	/**
+	 * @param mode
+	 * - `gesture`: user tapped ⛶ — try native first, CSS if blocked
+	 * - `orientation`: rotate — prefer CSS (native FS usually needs a gesture in
+	 *   both browser tabs and installed PWAs; CSS works everywhere)
+	 */
+	async function enterFullscreen(mode: 'gesture' | 'orientation' = 'gesture') {
+		if (!videoEl) return;
+		if (mode === 'orientation') {
+			enterCssFullscreen();
+			return;
+		}
+		const ok = await enterNativeFullscreen();
+		if (!ok) enterCssFullscreen();
+	}
+
+	async function exitFullscreen() {
+		leaveCssFullscreen();
+		try {
+			const el = videoEl as
+				| (HTMLVideoElement & { webkitExitFullscreen?: () => void; webkitDisplayingFullscreen?: boolean })
+				| undefined;
+			if (el?.webkitDisplayingFullscreen && typeof el.webkitExitFullscreen === 'function') {
+				el.webkitExitFullscreen();
+				return;
+			}
+			const doc = document as Document & { webkitExitFullscreen?: () => void };
+			if (document.fullscreenElement) {
+				await document.exitFullscreen();
+				return;
+			}
+			if (doc.webkitExitFullscreen) {
+				doc.webkitExitFullscreen();
+			}
+		} catch {
+			/* ignore */
+		}
+	}
+
+	async function toggleFullscreen() {
+		if (cssFullscreen || isNativeFullscreen()) await exitFullscreen();
+		else await enterFullscreen('gesture');
+	}
+
+	async function syncOrientationFullscreen() {
+		if (!videoEl || !activeSrc || orientFsBusy) return;
+		if (!isCoarsePointerMobile()) return;
+		orientFsBusy = true;
+		try {
+			if (isLandscape()) {
+				if (!cssFullscreen && !isNativeFullscreen()) {
+					await enterFullscreen('orientation');
+				}
+			} else if (cssFullscreen || isNativeFullscreen()) {
+				await exitFullscreen();
+			}
+		} finally {
+			orientFsBusy = false;
+		}
+	}
+
+	$effect(() => {
+		const ready = Boolean(videoEl && activeSrc);
+		if (typeof window === 'undefined') return;
+		const onOrient = () => {
+			void syncOrientationFullscreen();
+		};
+		window.addEventListener('orientationchange', onOrient);
+		window.screen?.orientation?.addEventListener?.('change', onOrient);
+		const mql = window.matchMedia('(orientation: landscape)');
+		const onMql = () => onOrient();
+		mql.addEventListener?.('change', onMql);
+		window.addEventListener('resize', onOrient);
+		if (ready) onOrient();
+		return () => {
+			window.removeEventListener('orientationchange', onOrient);
+			window.screen?.orientation?.removeEventListener?.('change', onOrient);
+			mql.removeEventListener?.('change', onMql);
+			window.removeEventListener('resize', onOrient);
+		};
+	});
+
 	function bumpChrome() {
 		if (locked) return;
 		showChrome = true;
 		clearTimeout(hideTimer);
 		hideTimer = setTimeout(() => {
 			if (playing) showChrome = false;
-		}, 2600);
+		}, 3200);
 	}
 
+	/** Only the center play button (and Space) may call this. */
 	function togglePlay() {
 		if (!videoEl || locked) return;
-		if (videoEl.paused) videoEl.play().catch(() => {});
-		else videoEl.pause();
+		if (videoEl.paused) {
+			userPaused = false;
+			videoEl.play().catch(() => {});
+		} else {
+			userPaused = true;
+			videoEl.pause();
+		}
 		bumpChrome();
 	}
 
@@ -125,7 +330,23 @@
 		bumpChrome();
 	}
 
-	function onPointerUp(e: PointerEvent) {
+	function isInteractiveTarget(target: EventTarget | null) {
+		return (
+			target instanceof Element &&
+			Boolean(
+				target.closest(
+					'button, select, input, a, .yt-scrub, .yt-tools, .yt-time-row, .yt-chrome-bottom, .yt-chrome-center'
+				)
+			)
+		);
+	}
+
+	/**
+	 * Stage taps: show/hide chrome or double-tap seek.
+	 * Never toggle play/pause — that is exclusive to the center button / Space.
+	 */
+	function onStagePointerUp(e: PointerEvent) {
+		if (isInteractiveTarget(e.target)) return;
 		if (locked) {
 			showChrome = true;
 			return;
@@ -142,20 +363,25 @@
 		lastTap = now;
 		lastTapX = x;
 		setTimeout(() => {
-			if (Date.now() - lastTap >= 280) {
-				if (showChrome && playing) {
-					showChrome = false;
-				} else {
-					togglePlay();
-				}
+			if (Date.now() - lastTap < 280) return;
+			if (showChrome) {
+				if (playing) showChrome = false;
+			} else {
+				bumpChrome();
 			}
 		}, 280);
 	}
 
 	function onScrub(e: Event) {
+		e.stopPropagation();
 		const v = Number((e.currentTarget as HTMLInputElement).value);
 		if (videoEl) videoEl.currentTime = v;
 		current = v;
+		bumpChrome();
+	}
+
+	function stopBubble(e: Event) {
+		e.stopPropagation();
 	}
 
 	async function pip() {
@@ -169,14 +395,44 @@
 	}
 
 	function setQuality(url: string) {
+		// Keep pause intent across quality switches.
 		activeSrc = url;
+	}
+
+	function onKeydown(e: KeyboardEvent) {
+		if (e.target instanceof HTMLInputElement || e.target instanceof HTMLSelectElement) return;
+		if (e.code === 'Space' || e.key === ' ') {
+			e.preventDefault();
+			togglePlay();
+		} else if (e.key === 'ArrowLeft') {
+			e.preventDefault();
+			seekBy(-10);
+		} else if (e.key === 'ArrowRight') {
+			e.preventDefault();
+			seekBy(10);
+		} else if (e.key === 'f' || e.key === 'F') {
+			e.preventDefault();
+			void toggleFullscreen();
+		} else if (e.key === 'Escape' && cssFullscreen) {
+			void exitFullscreen();
+		}
 	}
 
 	const progress = $derived(duration > 0 ? (current / duration) * 100 : 0);
 </script>
 
 <!-- svelte-ignore a11y_no_static_element_interactions -->
-<div class="yt-player" class:is-playing={playing} onpointerup={onPointerUp}>
+<div
+	class="yt-player"
+	class:is-playing={playing}
+	class:yt-css-fs={cssFullscreen}
+	bind:this={rootEl}
+	role="application"
+	aria-label={title || 'Video player'}
+	tabindex="0"
+	onpointerup={onStagePointerUp}
+	onkeydown={onKeydown}
+>
 	{#if activeSrc}
 		<video
 			bind:this={videoEl}
@@ -218,8 +474,14 @@
 		<div class="yt-spinner" aria-hidden="true"></div>
 	{/if}
 
+	{#if mediaError && activeSrc}
+		<div class="yt-player-empty" style="background:transparent">
+			<p>{mediaError}</p>
+		</div>
+	{/if}
+
 	{#if flash}
-		<div class="yt-seek-flash" class:left={flash.side === 'left'} class:right={flash.side === 'right'}>
+		<div class="yt-seek-flash" class:left={flash.side === 'left'} class:right={flash.side === 'right'} aria-hidden="true">
 			<span class="yt-seek-icon">{flash.side === 'left' ? '↺' : '↻'}</span>
 			<span>{flash.text}s</span>
 		</div>
@@ -231,9 +493,12 @@
 			<button
 				type="button"
 				class="yt-icon-btn"
+				aria-label={locked ? 'Unlock' : 'Lock'}
+				onpointerup={stopBubble}
 				onclick={(e) => {
 					e.stopPropagation();
 					locked = !locked;
+					if (!locked) bumpChrome();
 				}}
 			>
 				{locked ? '🔓' : '🔒'}
@@ -246,6 +511,7 @@
 					type="button"
 					class="yt-round-btn"
 					aria-label="-10s"
+					onpointerup={stopBubble}
 					onclick={(e) => {
 						e.stopPropagation();
 						seekBy(-10);
@@ -255,6 +521,7 @@
 					type="button"
 					class="yt-play-btn"
 					aria-label={playing ? 'Pause' : 'Play'}
+					onpointerup={stopBubble}
 					onclick={(e) => {
 						e.stopPropagation();
 						togglePlay();
@@ -270,6 +537,7 @@
 					type="button"
 					class="yt-round-btn"
 					aria-label="+10s"
+					onpointerup={stopBubble}
 					onclick={(e) => {
 						e.stopPropagation();
 						seekBy(10);
@@ -280,7 +548,12 @@
 
 		<!-- svelte-ignore a11y_no_static_element_interactions -->
 		<!-- svelte-ignore a11y_click_events_have_key_events -->
-		<div class="yt-chrome-bottom" onclick={(e) => e.stopPropagation()}>
+		<div
+			class="yt-chrome-bottom"
+			onpointerdown={stopBubble}
+			onpointerup={stopBubble}
+			onclick={stopBubble}
+		>
 			<div class="yt-time-row">
 				<span>{formatDuration(current)}</span>
 				<span>{formatDuration(duration)}</span>
@@ -297,6 +570,9 @@
 					value={current}
 					disabled={locked || !duration}
 					oninput={onScrub}
+					onpointerdown={stopBubble}
+					onpointerup={stopBubble}
+					ontouchstart={stopBubble}
 					aria-label="Seek"
 				/>
 			</div>
@@ -307,6 +583,7 @@
 					onchange={() => {
 						if (videoEl) videoEl.playbackRate = rate;
 					}}
+					onpointerup={stopBubble}
 					disabled={locked}
 				>
 					<option value={0.75}>0.75×</option>
@@ -319,6 +596,7 @@
 					<select
 						class="yt-select"
 						onchange={(e) => setQuality(e.currentTarget.value)}
+						onpointerup={stopBubble}
 						disabled={locked}
 					>
 						{#each qualities as q}
@@ -326,11 +604,14 @@
 						{/each}
 					</select>
 				{/if}
-				<button type="button" class="yt-text-btn" onclick={pip}>{t(lang, 'pip')}</button>
+				<button type="button" class="yt-text-btn" onpointerup={stopBubble} onclick={pip}
+					>{t(lang, 'pip')}</button
+				>
 				<button
 					type="button"
 					class="yt-text-btn"
-					onclick={() => videoEl?.requestFullscreen?.()}>⛶</button
+					onpointerup={stopBubble}
+					onclick={() => void toggleFullscreen()}>⛶</button
 				>
 			</div>
 		</div>

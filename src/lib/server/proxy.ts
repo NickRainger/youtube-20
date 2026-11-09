@@ -1,7 +1,27 @@
 import { INVIDIOUS, PIPED } from './instances';
 import { filterOutShorts } from './shorts';
+import {
+	StreamResolveError,
+	classifyUpstreamMessage,
+	toStreamResolveError,
+	type StreamErrorCode
+} from '#lib/stream-errors';
 
 type FetchOpts = { signal?: AbortSignal; timeoutMs?: number };
+
+async function readUpstreamError(res: Response): Promise<string> {
+	const text = await res.text().catch(() => '');
+	if (!text) return `HTTP ${res.status}`;
+	try {
+		const data = JSON.parse(text) as { error?: string; message?: string };
+		if (data.error) return String(data.error);
+		if (data.message) return String(data.message);
+	} catch {
+		/* not JSON */
+	}
+	const snippet = text.replace(/\s+/g, ' ').trim().slice(0, 240);
+	return snippet ? `HTTP ${res.status}: ${snippet}` : `HTTP ${res.status}`;
+}
 
 async function fetchJson<T>(url: string, opts: FetchOpts = {}): Promise<T> {
 	const controller = new AbortController();
@@ -11,10 +31,24 @@ async function fetchJson<T>(url: string, opts: FetchOpts = {}): Promise<T> {
 	try {
 		const res = await fetch(url, {
 			signal: controller.signal,
-			headers: { Accept: 'application/json' }
+			headers: { Accept: 'application/json' },
+			redirect: 'follow'
 		});
-		if (!res.ok) throw new Error(`HTTP ${res.status}`);
-		return (await res.json()) as T;
+		if (!res.ok) {
+			const detail = await readUpstreamError(res);
+			throw new StreamResolveError(classifyUpstreamMessage(detail), detail, detail);
+		}
+		const contentType = res.headers.get('content-type') || '';
+		if (contentType.includes('text/plain') || contentType.includes('text/html')) {
+			const text = (await res.text()).trim();
+			if (!text.startsWith('{') && !text.startsWith('[')) {
+				throw new StreamResolveError('no_stream', text || `non-JSON from ${url}`, text);
+			}
+			const data = JSON.parse(text) as T;
+			return data;
+		}
+		const data = (await res.json()) as T;
+		return data;
 	} finally {
 		clearTimeout(timer);
 		opts.signal?.removeEventListener('abort', onAbort);
@@ -35,8 +69,95 @@ async function withInstances<T>(
 			errors.push(`${instance}: ${e instanceof Error ? e.message : String(e)}`);
 		}
 	}
-	throw new Error(`All instances failed:\n${errors.join('\n')}`);
+	throw toStreamResolveError(
+		new Error(`All instances failed:\n${errors.join('\n')}`),
+		errors.join('\n')
+	);
 }
+
+/** Race instances in parallel — first usable JSON wins.
+ * Definitive `unavailable` from any host fails the race immediately (YouTube truth),
+ * so we do not wait out DNS timeouts on dead mirrors.
+ */
+async function raceInstances<T>(
+	instances: string[],
+	path: string,
+	opts?: FetchOpts & { accept?: (data: T, instance: string) => boolean }
+): Promise<{ data: T; instance: string }> {
+	const errors: string[] = [];
+	const accept = opts?.accept ?? (() => true);
+	const controllers = instances.map(() => new AbortController());
+
+	return await new Promise<{ data: T; instance: string }>((resolve, reject) => {
+		let pending = instances.length;
+		let settled = false;
+
+		if (!pending) {
+			reject(new StreamResolveError('no_stream', 'No instances configured'));
+			return;
+		}
+
+		const finishFail = () => {
+			if (settled) return;
+			settled = true;
+			reject(
+				toStreamResolveError(
+					new Error(`All instances failed:\n${errors.join('\n')}`),
+					errors.join('\n')
+				)
+			);
+		};
+
+		instances.forEach((instance, i) => {
+			const linked = new AbortController();
+			const onParentAbort = () => linked.abort();
+			opts?.signal?.addEventListener('abort', onParentAbort);
+			const onLocalAbort = () => linked.abort();
+			controllers[i].signal.addEventListener('abort', onLocalAbort);
+
+			(async () => {
+				try {
+					const data = await fetchJson<T>(`${instance}${path}`, {
+						...opts,
+						signal: linked.signal
+					});
+					if (!accept(data, instance)) {
+						throw new Error(`${instance}: rejected by filter`);
+					}
+					if (settled) return;
+					settled = true;
+					for (const c of controllers) c.abort();
+					resolve({ data, instance });
+				} catch (e) {
+					if (settled) return;
+					const wrapped = toStreamResolveError(e);
+					errors.push(`${instance}: ${wrapped.message}`);
+					// YouTube said the video is gone — stop waiting on other hosts.
+					if (wrapped.code === 'unavailable') {
+						settled = true;
+						for (const c of controllers) c.abort();
+						reject(
+							new StreamResolveError(
+								'unavailable',
+								'Video unavailable',
+								wrapped.details || wrapped.message
+							)
+						);
+						return;
+					}
+					pending -= 1;
+					if (pending <= 0) finishFail();
+				} finally {
+					opts?.signal?.removeEventListener('abort', onParentAbort);
+					controllers[i].signal.removeEventListener('abort', onLocalAbort);
+				}
+			})();
+		});
+	});
+}
+
+export { StreamResolveError };
+export type { StreamErrorCode };
 
 export type VideoItem = {
 	type?: string;
@@ -242,27 +363,51 @@ function mapPipedDetail(id: string, d: Record<string, unknown>): VideoDetail {
 }
 
 export async function getVideo(id: string, opts?: FetchOpts): Promise<VideoDetail> {
+	const raceOpts: FetchOpts = { ...opts, timeoutMs: opts?.timeoutMs ?? 7000 };
+
+	// Prefer Piped for metadata when Invidious is down — fail-fast on unavailable.
 	try {
-		const { data, instance } = await withInstances<VideoDetail>(
-			INVIDIOUS,
-			// local=true asks the instance to proxy/sign for its own egress when possible.
-			`/api/v1/videos/${encodeURIComponent(id)}?local=true`,
-			opts
-		);
-		data.videoThumbnails = absolutizeThumbs(data.videoThumbnails, instance);
-		data.authorThumbnails = absolutizeThumbs(data.authorThumbnails, instance);
-		if (data.recommendedVideos) data.recommendedVideos = onlyVideos(data.recommendedVideos);
-		return data;
-	} catch {
-		const { data } = await withInstances<Record<string, unknown>>(
+		const { data } = await raceInstances<Record<string, unknown>>(
 			PIPED,
 			`/streams/${encodeURIComponent(id)}`,
-			opts
+			{
+				...raceOpts,
+				accept: (data) => {
+					if ((data as { error?: string }).error) {
+						const detail = String((data as { error?: string }).error);
+						throw new StreamResolveError(classifyUpstreamMessage(detail), detail, detail);
+					}
+					return Boolean(data && (data.title || data.videoStreams));
+				}
+			}
 		);
-		if ((data as { error?: string }).error) {
-			throw new Error(String((data as { error?: string }).error));
-		}
 		return mapPipedDetail(id, data);
+	} catch (pipedErr) {
+		const piped = toStreamResolveError(pipedErr);
+		if (piped.code === 'unavailable') {
+			throw new StreamResolveError('unavailable', 'Video unavailable', piped.details);
+		}
+		try {
+			const { data, instance } = await raceInstances<VideoDetail>(
+				INVIDIOUS,
+				`/api/v1/videos/${encodeURIComponent(id)}?local=true`,
+				{
+					...raceOpts,
+					accept: (data) =>
+						Boolean(data && (data.title || data.videoId || data.formatStreams))
+				}
+			);
+			data.videoThumbnails = absolutizeThumbs(data.videoThumbnails, instance);
+			data.authorThumbnails = absolutizeThumbs(data.authorThumbnails, instance);
+			if (data.recommendedVideos) data.recommendedVideos = onlyVideos(data.recommendedVideos);
+			return data;
+		} catch (invErr) {
+			const inv = toStreamResolveError(invErr);
+			if (inv.code === 'unavailable') {
+				throw new StreamResolveError('unavailable', 'Video unavailable', inv.details);
+			}
+			throw piped.details || piped.message ? piped : inv;
+		}
 	}
 }
 
@@ -293,9 +438,23 @@ export async function getChannelVideos(id: string, opts?: FetchOpts): Promise<Vi
 	}
 }
 
+function isUnreliableMediaHost(url: string) {
+	try {
+		const host = new URL(url).hostname;
+		return /(^|\.)odycdn\.com$/i.test(host) || /(^|\.)lbry\.tv$/i.test(host);
+	} catch {
+		return true;
+	}
+}
+
 export function pickProgressiveStream(video: VideoDetail): string | null {
 	const streams = (video.formatStreams ?? []).filter(
-		(s) => s.container !== 'hls' && !String(s.type).toLowerCase().includes('mpegurl')
+		(s) =>
+			s.url &&
+			!isUnreliableMediaHost(s.url) &&
+			s.container !== 'hls' &&
+			!String(s.type).toLowerCase().includes('mpegurl') &&
+			!isHlsUrl(s.url)
 	);
 	if (streams.length) {
 		const mp4 = streams.filter((s) => s.container === 'mp4' || s.type?.includes('mp4'));
@@ -307,9 +466,144 @@ export function pickProgressiveStream(video: VideoDetail): string | null {
 		});
 		return sorted[0]?.url ?? null;
 	}
-	// Many public instances no longer expose muxed progressive URLs — HLS still works.
-	if (video.hlsUrl) return video.hlsUrl;
-	return video.formatStreams?.[0]?.url ?? null;
+	// Do NOT fall back to Invidious HLS here: child playlists still hit googlevideo
+	// with the instance IP and 403 in browsers.
+	return null;
+}
+
+function pickPipedMuxedQualities(data: Record<string, unknown>): {
+	streamUrl: string;
+	qualities: { label: string; url: string }[];
+} | null {
+	if ((data as { error?: string }).error) {
+		const detail = String((data as { error?: string }).error);
+		throw new StreamResolveError(classifyUpstreamMessage(detail), detail, detail);
+	}
+	const streams = ((data.videoStreams as Record<string, unknown>[]) ?? []).filter((s) => {
+		if (s.videoOnly) return false;
+		const url = String(s.url ?? '');
+		if (!url || isUnreliableMediaHost(url)) return false;
+		const format = String(s.format ?? s.mimeType ?? '').toLowerCase();
+		if (format.includes('hls') || isHlsUrl(url)) return false;
+		return true;
+	});
+	const qualities = streams
+		.map((s) => ({
+			label: String(s.quality ?? s.qualityLabel ?? 'auto'),
+			url: String(s.url)
+		}))
+		.sort((a, b) => {
+			const qa = parseInt(a.label, 10) || 0;
+			const qb = parseInt(b.label, 10) || 0;
+			return qb - qa;
+		});
+	if (!qualities.length) return null;
+	return { streamUrl: qualities[0].url, qualities };
+}
+
+/** Piped-first playable muxed MP4 (proxy URLs work from any viewer IP).
+ * Races public Piped APIs in parallel, then falls back to Invidious progressive.
+ */
+export async function resolvePlayableStream(
+	id: string,
+	opts?: FetchOpts
+): Promise<{
+	streamUrl: string;
+	qualities: { label: string; url: string }[];
+	hls: boolean;
+	source: string;
+}> {
+	const errors: string[] = [];
+	const streamOpts: FetchOpts = { ...opts, timeoutMs: opts?.timeoutMs ?? 7000 };
+	// Prefer known-live hosts first; still race the long tail for geo diversity.
+	const pipedOrder = [
+		...PIPED.filter((h) =>
+			/private\.coffee|ducks\.party|reallyaweso\.me|codespace|orangenet/.test(h)
+		),
+		...PIPED.filter(
+			(h) => !/private\.coffee|ducks\.party|reallyaweso\.me|codespace|orangenet/.test(h)
+		)
+	];
+
+	try {
+		const { data, instance } = await raceInstances<Record<string, unknown>>(
+			pipedOrder,
+			`/streams/${encodeURIComponent(id)}`,
+			{
+				...streamOpts,
+				accept: (data, instance) => {
+					const picked = pickPipedMuxedQualities(data);
+					if (!picked) {
+						throw new Error(`${instance}: no muxed progressive`);
+					}
+					return true;
+				}
+			}
+		);
+		const picked = pickPipedMuxedQualities(data);
+		if (picked) {
+			return {
+				streamUrl: picked.streamUrl,
+				qualities: picked.qualities,
+				hls: false,
+				source: `piped:${instance}`
+			};
+		}
+	} catch (e) {
+		const wrapped = toStreamResolveError(e, errors.join('\n'));
+		errors.push(wrapped.details || wrapped.message);
+		// Permanent unavailability — don't bother Invidious (same YouTube answer).
+		if (wrapped.code === 'unavailable') {
+			throw new StreamResolveError(
+				'unavailable',
+				'Video unavailable',
+				wrapped.details || errors.join('\n')
+			);
+		}
+	}
+
+	try {
+		const video = await getVideo(id, opts);
+		const streamUrl = pickProgressiveStream(video);
+		if (streamUrl) {
+			const qualities = (video.formatStreams ?? [])
+				.filter((s) => s.url && !isHlsUrl(s.url) && !isUnreliableMediaHost(s.url))
+				.map((s) => ({
+					label: s.qualityLabel || s.resolution || 'auto',
+					url: s.url
+				}));
+			return {
+				streamUrl,
+				qualities: qualities.length ? qualities : [{ label: 'auto', url: streamUrl }],
+				hls: false,
+				source: 'invidious-progressive'
+			};
+		}
+		errors.push('invidious: no progressive');
+	} catch (e) {
+		errors.push(`invidious: ${e instanceof Error ? e.message : String(e)}`);
+	}
+
+	const detail = errors.join('\n');
+	throw new StreamResolveError(classifyUpstreamMessage(detail), 'No playable stream', detail);
+}
+
+/** Best-effort metadata when full getVideo fails (watch page partial UI). */
+export async function getVideoSoft(
+	id: string,
+	opts?: FetchOpts
+): Promise<{ video: VideoDetail | null; unavailable?: boolean; errorCode?: StreamErrorCode }> {
+	try {
+		const video = await getVideo(id, opts);
+		return { video };
+	} catch (e) {
+		const wrapped = toStreamResolveError(e);
+		return {
+			video: null,
+			unavailable: wrapped.code === 'unavailable',
+			errorCode: wrapped.code
+		};
+	}
 }
 
 export function isHlsUrl(url: string | null | undefined): boolean {
