@@ -37,9 +37,13 @@
 		<div class="flex-1">
 			<a href="/" class="font-display text-lg font-extrabold tracking-tight">
 				<span class="inline-flex items-center gap-2">
-					<span class="grid h-8 w-8 place-items-center rounded-xl bg-primary text-primary-content shadow-lg shadow-primary/30"
-						>▶</span
-					>
+					<img
+						src={favicon}
+						alt=""
+						width="32"
+						height="32"
+						class="h-8 w-8 rounded-xl shadow-lg shadow-primary/30"
+					/>
 					YouTube 2.0
 				</span>
 			</a>

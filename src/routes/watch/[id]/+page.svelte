@@ -12,6 +12,7 @@
 	} from '#lib/library.svelte';
 	import { t } from '#lib/i18n';
 	import { sanitizeDescriptionHtml } from '#lib/sanitize';
+	import { resolveStreamClient } from '#lib/stream';
 
 	let video = $state<any>(null);
 	let streamUrl = $state<string | null>(null);
@@ -29,18 +30,45 @@
 		loading = true;
 		errorMsg = '';
 		video = null;
-		Promise.all([
-			fetch(`/api/videos/${videoId}`).then(async (r) => {
-				if (!r.ok) throw new Error((await r.text()).slice(0, 400));
-				return r.json();
-			}),
-			fetch(`/api/comments/${videoId}`).then((r) => r.json()).catch(() => ({ comments: [] }))
-		])
-			.then(([data, c]) => {
+		streamUrl = null;
+		qualities = [];
+
+		(async () => {
+			try {
+				// Metadata via our API (server Invidious) + streams via browser (local=true)
+				const [metaRes, stream, c] = await Promise.all([
+					fetch(`/api/videos/${videoId}`)
+						.then(async (r) => (r.ok ? r.json() : null))
+						.catch(() => null),
+					resolveStreamClient(videoId),
+					fetch(`/api/comments/${videoId}`)
+						.then((r) => r.json())
+						.catch(() => ({ comments: [] }))
+				]);
 				if (cancelled) return;
-				video = data.video;
-				streamUrl = data.streamUrl;
-				qualities = data.qualities ?? [];
+
+				const base = metaRes?.video ?? stream.meta ?? {};
+				video = {
+					...base,
+					videoId: base.videoId || videoId,
+					title: base.title || stream.meta?.title,
+					author: base.author || stream.meta?.author,
+					authorId: base.authorId || stream.meta?.authorId,
+					description: base.description || stream.meta?.description,
+					descriptionHtml: base.descriptionHtml || stream.meta?.descriptionHtml,
+					viewCount: base.viewCount ?? stream.meta?.viewCount,
+					publishedText: base.publishedText || stream.meta?.publishedText,
+					lengthSeconds: base.lengthSeconds ?? stream.meta?.lengthSeconds,
+					videoThumbnails: base.videoThumbnails || stream.meta?.videoThumbnails,
+					authorThumbnails: base.authorThumbnails || stream.meta?.authorThumbnails,
+					subCountText: base.subCountText || stream.meta?.subCountText,
+					recommendedVideos:
+						(base.recommendedVideos?.length
+							? base.recommendedVideos
+							: stream.meta?.recommendedVideos) ?? []
+				};
+				streamUrl = stream.streamUrl;
+				qualities = stream.qualities;
 				comments = c.comments ?? [];
 				addHistory({
 					videoId: video.videoId,
@@ -51,13 +79,13 @@
 					videoThumbnails: video.videoThumbnails,
 					viewCount: video.viewCount
 				});
-			})
-			.catch((e) => {
+			} catch (e) {
 				if (!cancelled) errorMsg = e instanceof Error ? e.message : t(lang, 'errorLoad');
-			})
-			.finally(() => {
+			} finally {
 				if (!cancelled) loading = false;
-			});
+			}
+		})();
+
 		return () => {
 			cancelled = true;
 		};
@@ -77,7 +105,7 @@
 {#if video}
 	<div class="mx-auto max-w-6xl lg:grid lg:grid-cols-[1fr_340px] lg:gap-6 lg:px-6 lg:pt-4">
 		<div>
-			<div class="overflow-hidden lg:rounded-2xl">
+			<div class="overflow-hidden bg-black lg:rounded-2xl">
 				<Player
 					src={streamUrl}
 					{qualities}

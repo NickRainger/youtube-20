@@ -245,7 +245,8 @@ export async function getVideo(id: string, opts?: FetchOpts): Promise<VideoDetai
 	try {
 		const { data, instance } = await withInstances<VideoDetail>(
 			INVIDIOUS,
-			`/api/v1/videos/${encodeURIComponent(id)}`,
+			// local=true asks the instance to proxy/sign for its own egress when possible.
+			`/api/v1/videos/${encodeURIComponent(id)}?local=true`,
 			opts
 		);
 		data.videoThumbnails = absolutizeThumbs(data.videoThumbnails, instance);
