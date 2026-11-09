@@ -19,5 +19,8 @@ export const GET: RequestHandler = async ({ url, cookies, locals }) => {
 		maxAge: 600
 	});
 	const origin = `${url.protocol}//${url.host}`;
-	redirect(302, authUrl(origin, state));
+	// SvelteKit 3 blocks external redirects unless opted in
+	redirect(302, authUrl(origin, state), {
+		external: ['https://accounts.google.com']
+	});
 };
