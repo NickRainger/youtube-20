@@ -193,6 +193,25 @@ a.group:hover .thumb-frame img {
 	color: #fff;
 }
 
+/* Fallback when Fullscreen API / webkitEnterFullscreen is blocked (common on iOS). */
+.yt-player.yt-css-fs {
+	position: fixed;
+	inset: 0;
+	z-index: 10000;
+	width: 100vw;
+	height: 100dvh;
+	max-height: 100dvh;
+	aspect-ratio: auto;
+	border-radius: 0;
+	background: #000;
+}
+
+.yt-player.yt-css-fs video {
+	width: 100%;
+	height: 100%;
+	object-fit: contain;
+}
+
 .player-stage video,
 .yt-player video {
 	width: 100%;
