@@ -50,6 +50,9 @@ const dict = {
 		offline: 'Je bent offline — app-shell is beschikbaar.',
 		installHint: 'Installeer als app via je browser-menu.',
 		regionNL: 'Trending NL',
+		forYou: 'Voor jou',
+		forYouHint: 'Recente video’s van je Google-abonnementen (geen Shorts).',
+		forYouSignIn: 'Log in met Google om je persoonlijke feed te zien.',
 		localLibrary: 'Lokaal op dit apparaat',
 		googleSubs: 'Google-abonnementen',
 		localSubs: 'Lokale abonnementen'
@@ -104,6 +107,9 @@ const dict = {
 		offline: 'You are offline — app shell is available.',
 		installHint: 'Install as an app from your browser menu.',
 		regionNL: 'Trending NL',
+		forYou: 'For you',
+		forYouHint: 'Recent uploads from your Google subscriptions (no Shorts).',
+		forYouSignIn: 'Sign in with Google to see your personal feed.',
 		localLibrary: 'Local on this device',
 		googleSubs: 'Google subscriptions',
 		localSubs: 'Local subscriptions'

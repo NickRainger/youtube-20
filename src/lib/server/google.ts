@@ -117,6 +117,102 @@ export async function listSubscriptions(accessToken: string) {
 	);
 }
 
+/** Uploads playlist id for a channel (UC… → UU…). */
+export function uploadsPlaylistId(channelId: string): string | null {
+	if (!channelId.startsWith('UC') || channelId.length < 3) return null;
+	return `UU${channelId.slice(2)}`;
+}
+
+export type FeedVideo = {
+	videoId: string;
+	title: string;
+	author: string;
+	authorId: string;
+	publishedAt?: string;
+	publishedText?: string;
+	thumbnail?: string;
+	lengthSeconds?: number;
+	videoThumbnails?: { url: string; width: number; height: number }[];
+};
+
+/**
+ * Personalized-ish home feed: recent uploads from the user’s subscriptions
+ * via YouTube Data API (not InnerTube — that needs YouTube web cookies).
+ */
+export async function listSubscriptionFeed(
+	accessToken: string,
+	opts: { channelLimit?: number; perChannel?: number } = {}
+): Promise<FeedVideo[]> {
+	const channelLimit = opts.channelLimit ?? 24;
+	const perChannel = opts.perChannel ?? 4;
+	const subs = await listSubscriptions(accessToken);
+	const channels = (subs.items ?? [])
+		.map((item: Record<string, unknown>) => {
+			const snippet = item.snippet as Record<string, unknown> | undefined;
+			const resource = snippet?.resourceId as Record<string, string> | undefined;
+			return {
+				authorId: resource?.channelId ?? '',
+				author: String(snippet?.title ?? '')
+			};
+		})
+		.filter((c: { authorId: string }) => c.authorId)
+		.slice(0, channelLimit);
+
+	const batches = await Promise.all(
+		channels.map(async (ch: { authorId: string; author: string }) => {
+			const playlistId = uploadsPlaylistId(ch.authorId);
+			if (!playlistId) return [] as FeedVideo[];
+			try {
+				const data = await ytGet(
+					`/playlistItems?part=snippet,contentDetails&playlistId=${encodeURIComponent(playlistId)}&maxResults=${perChannel}`,
+					accessToken
+				);
+				return (data.items ?? [])
+					.map((item: Record<string, unknown>) => {
+						const snippet = item.snippet as Record<string, unknown> | undefined;
+						const content = item.contentDetails as Record<string, string> | undefined;
+						const thumbs = snippet?.thumbnails as
+							| Record<string, { url: string; width?: number; height?: number }>
+							| undefined;
+						const videoId = content?.videoId || String(snippet?.resourceId && (snippet.resourceId as { videoId?: string }).videoId || '');
+						if (!videoId) return null;
+						const thumb =
+							thumbs?.medium?.url || thumbs?.high?.url || thumbs?.default?.url || '';
+						return {
+							videoId,
+							title: String(snippet?.title ?? ''),
+							author: ch.author || String(snippet?.channelTitle ?? ''),
+							authorId: ch.authorId || String(snippet?.channelId ?? ''),
+							publishedAt: content?.videoPublishedAt || String(snippet?.publishedAt ?? ''),
+							publishedText: String(snippet?.publishedAt ?? ''),
+							thumbnail: thumb,
+							videoThumbnails: thumb
+								? [{ url: thumb, width: 320, height: 180 }]
+								: []
+						} satisfies FeedVideo;
+					})
+					.filter(Boolean) as FeedVideo[];
+			} catch {
+				return [] as FeedVideo[];
+			}
+		})
+	);
+
+	const merged = batches.flat();
+	merged.sort((a, b) => {
+		const ta = Date.parse(a.publishedAt || '') || 0;
+		const tb = Date.parse(b.publishedAt || '') || 0;
+		return tb - ta;
+	});
+	// Dedupe by videoId
+	const seen = new Set<string>();
+	return merged.filter((v) => {
+		if (seen.has(v.videoId)) return false;
+		seen.add(v.videoId);
+		return true;
+	});
+}
+
 /** Sample data when Google secrets are unset (local / pre-secret publish). */
 export function mockPlaylists() {
 	return {

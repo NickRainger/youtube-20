@@ -3,23 +3,49 @@
 	import VideoCard from '#lib/components/VideoCard.svelte';
 	import { getLibrary } from '#lib/library.svelte';
 	import { t } from '#lib/i18n';
+	import type { PageProps } from './$types';
+
+	let { data }: PageProps = $props();
+
+	type Source = 'foryou' | 'trending' | 'popular';
 
 	let videos = $state<any[]>([]);
 	let loading = $state(true);
 	let errorMsg = $state('');
-	let source = $state<'trending' | 'popular'>('trending');
+	let source = $state<Source>('foryou');
+	let feedMeta = $state<{ needsAuth?: boolean; feedSource?: string }>({});
 	const lang = $derived(getLibrary().lang);
 
-	async function load(next: 'trending' | 'popular' = source) {
+	async function load(next: Source = source) {
 		source = next;
 		loading = true;
 		errorMsg = '';
+		feedMeta = {};
 		try {
-			const path = next === 'trending' ? '/api/trending?region=NL' : '/api/popular';
-			const res = await fetch(path);
-			if (!res.ok) throw new Error((await res.text()).slice(0, 400));
-			const data = await res.json();
-			videos = data.videos ?? [];
+			if (next === 'foryou') {
+				const seed = getLibrary().history[0]?.videoId;
+				const qs = seed ? `?seed=${encodeURIComponent(seed)}` : '';
+				const res = await fetch(`/api/youtube/feed${qs}`);
+				if (!res.ok) throw new Error((await res.text()).slice(0, 400));
+				const body = await res.json();
+				videos = body.videos ?? [];
+				feedMeta = { needsAuth: body.needsAuth, feedSource: body.source };
+				// Logged out + empty: soft-fallback to trending so home isn’t blank
+				if (!videos.length && body.needsAuth) {
+					const tr = await fetch('/api/trending?region=NL');
+					if (tr.ok) {
+						const td = await tr.json();
+						videos = td.videos ?? [];
+						feedMeta = { needsAuth: true, feedSource: 'trending-fallback' };
+					}
+				}
+			} else {
+				const path = next === 'trending' ? '/api/trending?region=NL' : '/api/popular';
+				const res = await fetch(path);
+				if (!res.ok) throw new Error((await res.text()).slice(0, 400));
+				const body = await res.json();
+				videos = body.videos ?? [];
+			}
 		} catch (e) {
 			errorMsg = e instanceof Error ? e.message : t(lang, 'errorLoad');
 		} finally {
@@ -28,7 +54,7 @@
 	}
 
 	onMount(() => {
-		void load('trending');
+		void load('foryou');
 	});
 </script>
 
@@ -54,6 +80,10 @@
 
 	<div class="mb-4 flex gap-2 overflow-x-auto">
 		<button
+			class="btn btn-sm rounded-full {source === 'foryou' ? 'btn-neutral' : 'btn-ghost'}"
+			onclick={() => load('foryou')}>{t(lang, 'forYou')}</button
+		>
+		<button
 			class="btn btn-sm rounded-full {source === 'trending' ? 'btn-neutral' : 'btn-ghost'}"
 			onclick={() => load('trending')}>{t(lang, 'regionNL')}</button
 		>
@@ -63,12 +93,26 @@
 		>
 	</div>
 
-	<div class="mb-4 flex items-baseline justify-between">
+	<div class="mb-4 flex flex-wrap items-baseline justify-between gap-2">
 		<h2 class="font-display text-xl font-bold">
-			{source === 'trending' ? t(lang, 'trending') : t(lang, 'popular')}
+			{source === 'foryou'
+				? t(lang, 'forYou')
+				: source === 'trending'
+					? t(lang, 'trending')
+					: t(lang, 'popular')}
 		</h2>
 		<span class="text-sm opacity-50">{t(lang, 'shortsFiltered')}</span>
 	</div>
+
+	{#if source === 'foryou'}
+		<p class="mb-4 text-sm opacity-60">{t(lang, 'forYouHint')}</p>
+		{#if feedMeta.needsAuth && !data.user}
+			<div class="alert mb-4 text-sm">
+				<span>{t(lang, 'forYouSignIn')}</span>
+				<a class="btn btn-sm btn-primary rounded-full" href="/auth/google">{t(lang, 'signInGoogle')}</a>
+			</div>
+		{/if}
+	{/if}
 
 	{#if errorMsg}
 		<div class="alert alert-error mb-4 whitespace-pre-wrap text-sm">{errorMsg}</div>
