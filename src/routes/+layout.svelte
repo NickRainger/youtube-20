@@ -19,7 +19,8 @@
 </script>
 
 <svelte:head>
-	<link rel="icon" href={favicon} />
+	<link rel="icon" href={favicon} type="image/svg+xml" />
+	<link rel="icon" href="/favicon.png" sizes="64x64" type="image/png" />
 	<link rel="preconnect" href="https://fonts.googleapis.com" />
 	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin="anonymous" />
 	<link
@@ -28,7 +29,7 @@
 	/>
 	<meta name="theme-color" content="#e11d2e" />
 	<meta name="description" content="YouTube 2.0 — soepel kijken zonder Shorts en zonder advertenties" />
-	<link rel="apple-touch-icon" href="/icons/icon-192.png" />
+	<link rel="apple-touch-icon" href="/icons/apple-touch-icon.png" />
 	<title>YouTube 2.0</title>
 </svelte:head>
 
@@ -38,11 +39,12 @@
 			<a href="/" class="font-display text-lg font-extrabold tracking-tight">
 				<span class="inline-flex items-center gap-2">
 					<img
-						src={favicon}
+						src="/icons/logo.svg"
 						alt=""
 						width="32"
 						height="32"
 						class="h-8 w-8 rounded-xl shadow-lg shadow-primary/30"
+						decoding="async"
 					/>
 					YouTube 2.0
 				</span>
