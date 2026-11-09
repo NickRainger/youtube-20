@@ -65,7 +65,6 @@
 		if (!url) return;
 
 		let cancelled = false;
-		// Capture pause intent at attach start so a later pause isn't overwritten by late play().
 		const shouldAutoplay = () => !cancelled && gen === attachGen && !userPaused;
 
 		async function attach() {
@@ -168,38 +167,75 @@
 		);
 	}
 
-	async function enterFullscreen() {
+	/** CSS faux-fullscreen — works in browser tabs + PWA without a user gesture. */
+	function enterCssFullscreen() {
+		cssFullscreen = true;
+		try {
+			document.documentElement.classList.add('yt-fs-lock');
+			document.body.classList.add('yt-fs-lock');
+		} catch {
+			/* ignore */
+		}
+	}
+
+	function leaveCssFullscreen() {
+		cssFullscreen = false;
+		try {
+			document.documentElement.classList.remove('yt-fs-lock');
+			document.body.classList.remove('yt-fs-lock');
+		} catch {
+			/* ignore */
+		}
+	}
+
+	async function enterNativeFullscreen(): Promise<boolean> {
 		const el = videoEl;
 		const root = rootEl;
-		if (!el) return;
-
+		if (!el) return false;
 		try {
 			const anyEl = el as HTMLVideoElement & {
 				webkitEnterFullscreen?: () => void;
-				webkitSupportsFullscreen?: boolean;
 			};
-			// iOS Safari: only the <video> can go fullscreen (no element Fullscreen API).
+			// iOS Safari: video-only FS; usually needs a user gesture.
 			if (typeof anyEl.webkitEnterFullscreen === 'function') {
 				anyEl.webkitEnterFullscreen();
-				return;
+				await new Promise((r) => setTimeout(r, 80));
+				return isNativeFullscreen();
 			}
 			if (root?.requestFullscreen) {
 				await root.requestFullscreen();
-				return;
+				return isNativeFullscreen();
 			}
 			const rootWebkit = root as (HTMLDivElement & { webkitRequestFullscreen?: () => void }) | undefined;
 			if (rootWebkit?.webkitRequestFullscreen) {
 				rootWebkit.webkitRequestFullscreen();
-				return;
+				await new Promise((r) => setTimeout(r, 80));
+				return isNativeFullscreen();
 			}
 		} catch {
-			/* fall through to CSS */
+			return false;
 		}
-		cssFullscreen = true;
+		return false;
+	}
+
+	/**
+	 * @param mode
+	 * - `gesture`: user tapped ⛶ — try native first, CSS if blocked
+	 * - `orientation`: rotate — prefer CSS (native FS usually needs a gesture in
+	 *   both browser tabs and installed PWAs; CSS works everywhere)
+	 */
+	async function enterFullscreen(mode: 'gesture' | 'orientation' = 'gesture') {
+		if (!videoEl) return;
+		if (mode === 'orientation') {
+			enterCssFullscreen();
+			return;
+		}
+		const ok = await enterNativeFullscreen();
+		if (!ok) enterCssFullscreen();
 	}
 
 	async function exitFullscreen() {
-		cssFullscreen = false;
+		leaveCssFullscreen();
 		try {
 			const el = videoEl as
 				| (HTMLVideoElement & { webkitExitFullscreen?: () => void; webkitDisplayingFullscreen?: boolean })
@@ -223,7 +259,7 @@
 
 	async function toggleFullscreen() {
 		if (cssFullscreen || isNativeFullscreen()) await exitFullscreen();
-		else await enterFullscreen();
+		else await enterFullscreen('gesture');
 	}
 
 	async function syncOrientationFullscreen() {
@@ -232,7 +268,9 @@
 		orientFsBusy = true;
 		try {
 			if (isLandscape()) {
-				if (!cssFullscreen && !isNativeFullscreen()) await enterFullscreen();
+				if (!cssFullscreen && !isNativeFullscreen()) {
+					await enterFullscreen('orientation');
+				}
 			} else if (cssFullscreen || isNativeFullscreen()) {
 				await exitFullscreen();
 			}
@@ -242,7 +280,6 @@
 	}
 
 	$effect(() => {
-		// Re-bind when media is ready so a landscape phone can enter FS after stream attaches.
 		const ready = Boolean(videoEl && activeSrc);
 		if (typeof window === 'undefined') return;
 		const onOrient = () => {
@@ -253,11 +290,13 @@
 		const mql = window.matchMedia('(orientation: landscape)');
 		const onMql = () => onOrient();
 		mql.addEventListener?.('change', onMql);
+		window.addEventListener('resize', onOrient);
 		if (ready) onOrient();
 		return () => {
 			window.removeEventListener('orientationchange', onOrient);
 			window.screen?.orientation?.removeEventListener?.('change', onOrient);
 			mql.removeEventListener?.('change', onMql);
+			window.removeEventListener('resize', onOrient);
 		};
 	});
 
@@ -267,9 +306,10 @@
 		clearTimeout(hideTimer);
 		hideTimer = setTimeout(() => {
 			if (playing) showChrome = false;
-		}, 2600);
+		}, 3200);
 	}
 
+	/** Only the center play button (and Space) may call this. */
 	function togglePlay() {
 		if (!videoEl || locked) return;
 		if (videoEl.paused) {
@@ -290,18 +330,23 @@
 		bumpChrome();
 	}
 
-	function fromChromeControls(target: EventTarget | null) {
-		// Chrome is full-bleed; only ignore real controls so empty chrome taps still hide UI.
+	function isInteractiveTarget(target: EventTarget | null) {
 		return (
 			target instanceof Element &&
-			Boolean(target.closest('button, select, input, .yt-scrub, .yt-tools, .yt-time-row'))
+			Boolean(
+				target.closest(
+					'button, select, input, a, .yt-scrub, .yt-tools, .yt-time-row, .yt-chrome-bottom, .yt-chrome-center'
+				)
+			)
 		);
 	}
 
-	function onPointerUp(e: PointerEvent) {
-		// Pause/play and other chrome controls also fire pointerup on the player shell.
-		// Ignoring them prevents the 280ms tap handler from toggling play again (~0.5s auto-resume).
-		if (fromChromeControls(e.target)) return;
+	/**
+	 * Stage taps: show/hide chrome or double-tap seek.
+	 * Never toggle play/pause — that is exclusive to the center button / Space.
+	 */
+	function onStagePointerUp(e: PointerEvent) {
+		if (isInteractiveTarget(e.target)) return;
 		if (locked) {
 			showChrome = true;
 			return;
@@ -318,20 +363,25 @@
 		lastTap = now;
 		lastTapX = x;
 		setTimeout(() => {
-			if (Date.now() - lastTap >= 280) {
-				if (showChrome && playing) {
-					showChrome = false;
-				} else {
-					togglePlay();
-				}
+			if (Date.now() - lastTap < 280) return;
+			if (showChrome) {
+				if (playing) showChrome = false;
+			} else {
+				bumpChrome();
 			}
 		}, 280);
 	}
 
 	function onScrub(e: Event) {
+		e.stopPropagation();
 		const v = Number((e.currentTarget as HTMLInputElement).value);
 		if (videoEl) videoEl.currentTime = v;
 		current = v;
+		bumpChrome();
+	}
+
+	function stopBubble(e: Event) {
+		e.stopPropagation();
 	}
 
 	async function pip() {
@@ -345,8 +395,27 @@
 	}
 
 	function setQuality(url: string) {
-		userPaused = false;
+		// Keep pause intent across quality switches.
 		activeSrc = url;
+	}
+
+	function onKeydown(e: KeyboardEvent) {
+		if (e.target instanceof HTMLInputElement || e.target instanceof HTMLSelectElement) return;
+		if (e.code === 'Space' || e.key === ' ') {
+			e.preventDefault();
+			togglePlay();
+		} else if (e.key === 'ArrowLeft') {
+			e.preventDefault();
+			seekBy(-10);
+		} else if (e.key === 'ArrowRight') {
+			e.preventDefault();
+			seekBy(10);
+		} else if (e.key === 'f' || e.key === 'F') {
+			e.preventDefault();
+			void toggleFullscreen();
+		} else if (e.key === 'Escape' && cssFullscreen) {
+			void exitFullscreen();
+		}
 	}
 
 	const progress = $derived(duration > 0 ? (current / duration) * 100 : 0);
@@ -358,7 +427,11 @@
 	class:is-playing={playing}
 	class:yt-css-fs={cssFullscreen}
 	bind:this={rootEl}
-	onpointerup={onPointerUp}
+	role="application"
+	aria-label={title || 'Video player'}
+	tabindex="0"
+	onpointerup={onStagePointerUp}
+	onkeydown={onKeydown}
 >
 	{#if activeSrc}
 		<video
@@ -408,7 +481,7 @@
 	{/if}
 
 	{#if flash}
-		<div class="yt-seek-flash" class:left={flash.side === 'left'} class:right={flash.side === 'right'}>
+		<div class="yt-seek-flash" class:left={flash.side === 'left'} class:right={flash.side === 'right'} aria-hidden="true">
 			<span class="yt-seek-icon">{flash.side === 'left' ? '↺' : '↻'}</span>
 			<span>{flash.text}s</span>
 		</div>
@@ -420,9 +493,12 @@
 			<button
 				type="button"
 				class="yt-icon-btn"
+				aria-label={locked ? 'Unlock' : 'Lock'}
+				onpointerup={stopBubble}
 				onclick={(e) => {
 					e.stopPropagation();
 					locked = !locked;
+					if (!locked) bumpChrome();
 				}}
 			>
 				{locked ? '🔓' : '🔒'}
@@ -435,6 +511,7 @@
 					type="button"
 					class="yt-round-btn"
 					aria-label="-10s"
+					onpointerup={stopBubble}
 					onclick={(e) => {
 						e.stopPropagation();
 						seekBy(-10);
@@ -444,6 +521,7 @@
 					type="button"
 					class="yt-play-btn"
 					aria-label={playing ? 'Pause' : 'Play'}
+					onpointerup={stopBubble}
 					onclick={(e) => {
 						e.stopPropagation();
 						togglePlay();
@@ -459,6 +537,7 @@
 					type="button"
 					class="yt-round-btn"
 					aria-label="+10s"
+					onpointerup={stopBubble}
 					onclick={(e) => {
 						e.stopPropagation();
 						seekBy(10);
@@ -469,7 +548,12 @@
 
 		<!-- svelte-ignore a11y_no_static_element_interactions -->
 		<!-- svelte-ignore a11y_click_events_have_key_events -->
-		<div class="yt-chrome-bottom" onclick={(e) => e.stopPropagation()}>
+		<div
+			class="yt-chrome-bottom"
+			onpointerdown={stopBubble}
+			onpointerup={stopBubble}
+			onclick={stopBubble}
+		>
 			<div class="yt-time-row">
 				<span>{formatDuration(current)}</span>
 				<span>{formatDuration(duration)}</span>
@@ -486,6 +570,9 @@
 					value={current}
 					disabled={locked || !duration}
 					oninput={onScrub}
+					onpointerdown={stopBubble}
+					onpointerup={stopBubble}
+					ontouchstart={stopBubble}
 					aria-label="Seek"
 				/>
 			</div>
@@ -496,6 +583,7 @@
 					onchange={() => {
 						if (videoEl) videoEl.playbackRate = rate;
 					}}
+					onpointerup={stopBubble}
 					disabled={locked}
 				>
 					<option value={0.75}>0.75×</option>
@@ -508,6 +596,7 @@
 					<select
 						class="yt-select"
 						onchange={(e) => setQuality(e.currentTarget.value)}
+						onpointerup={stopBubble}
 						disabled={locked}
 					>
 						{#each qualities as q}
@@ -515,8 +604,15 @@
 						{/each}
 					</select>
 				{/if}
-				<button type="button" class="yt-text-btn" onclick={pip}>{t(lang, 'pip')}</button>
-				<button type="button" class="yt-text-btn" onclick={() => void toggleFullscreen()}>⛶</button>
+				<button type="button" class="yt-text-btn" onpointerup={stopBubble} onclick={pip}
+					>{t(lang, 'pip')}</button
+				>
+				<button
+					type="button"
+					class="yt-text-btn"
+					onpointerup={stopBubble}
+					onclick={() => void toggleFullscreen()}>⛶</button
+				>
 			</div>
 		</div>
 	</div>
