@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { t, type Lang } from '#lib/i18n';
 	import { formatDuration } from '#lib/format';
+	import type HlsType from 'hls.js';
 
 	type Quality = { label: string; url: string };
 
@@ -30,9 +31,52 @@
 	let hideTimer: ReturnType<typeof setTimeout> | undefined;
 	let lastTap = 0;
 	let lastTapX = 0;
+	let hls: HlsType | null = null;
+
+	function looksLikeHls(url: string) {
+		return /m3u8|hls_variant|\/hls[/_]/i.test(url);
+	}
 
 	$effect(() => {
 		activeSrc = src;
+	});
+
+	$effect(() => {
+		const el = videoEl;
+		const url = activeSrc;
+		hls?.destroy();
+		hls = null;
+		if (!el || !url) return;
+
+		let cancelled = false;
+
+		async function attach() {
+			if (!el || !url) return;
+			if (looksLikeHls(url)) {
+				if (el.canPlayType('application/vnd.apple.mpegurl')) {
+					el.src = url;
+					return;
+				}
+				const { default: Hls } = await import('hls.js');
+				if (cancelled || !el) return;
+				if (Hls.isSupported()) {
+					const instance = new Hls({ enableWorker: true });
+					hls = instance;
+					instance.loadSource(url);
+					instance.attachMedia(el);
+					return;
+				}
+			}
+			el.src = url;
+		}
+
+		void attach();
+
+		return () => {
+			cancelled = true;
+			hls?.destroy();
+			hls = null;
+		};
 	});
 
 	function bumpChrome() {
@@ -108,10 +152,12 @@
 	}
 
 	$effect(() => {
-		if (videoEl && activeSrc) {
+		if (!videoEl || !activeSrc) return;
+		// Native progressive: load(); HLS is attached in the effect above.
+		if (!looksLikeHls(activeSrc)) {
 			videoEl.load();
-			videoEl.play().catch(() => {});
 		}
+		videoEl.play().catch(() => {});
 	});
 </script>
 
@@ -120,7 +166,6 @@
 	{#if activeSrc}
 		<video
 			bind:this={videoEl}
-			src={activeSrc}
 			{poster}
 			playsinline
 			preload="metadata"

@@ -296,15 +296,24 @@ export function pickProgressiveStream(video: VideoDetail): string | null {
 	const streams = (video.formatStreams ?? []).filter(
 		(s) => s.container !== 'hls' && !String(s.type).toLowerCase().includes('mpegurl')
 	);
-	if (!streams.length) return video.formatStreams?.[0]?.url ?? null;
-	const mp4 = streams.filter((s) => s.container === 'mp4' || s.type?.includes('mp4'));
-	const pool = mp4.length ? mp4 : streams;
-	const sorted = [...pool].sort((a, b) => {
-		const qa = parseInt(a.qualityLabel || a.resolution || '0', 10) || 0;
-		const qb = parseInt(b.qualityLabel || b.resolution || '0', 10) || 0;
-		return qb - qa;
-	});
-	return sorted[0]?.url ?? null;
+	if (streams.length) {
+		const mp4 = streams.filter((s) => s.container === 'mp4' || s.type?.includes('mp4'));
+		const pool = mp4.length ? mp4 : streams;
+		const sorted = [...pool].sort((a, b) => {
+			const qa = parseInt(a.qualityLabel || a.resolution || '0', 10) || 0;
+			const qb = parseInt(b.qualityLabel || b.resolution || '0', 10) || 0;
+			return qb - qa;
+		});
+		return sorted[0]?.url ?? null;
+	}
+	// Many public instances no longer expose muxed progressive URLs — HLS still works.
+	if (video.hlsUrl) return video.hlsUrl;
+	return video.formatStreams?.[0]?.url ?? null;
+}
+
+export function isHlsUrl(url: string | null | undefined): boolean {
+	if (!url) return false;
+	return /m3u8|hls_variant|\/hls[/_]/i.test(url);
 }
 
 export function bestThumb(

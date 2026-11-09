@@ -1,10 +1,10 @@
-/** Rotated on failure — public instances change often. */
+/** Rotated on failure — public instances change often. Prefer API-enabled hosts first. */
 export const INVIDIOUS = [
+	'https://yt.chocolatemoo53.com',
 	'https://invidious.materialio.us',
-	'https://inv.nadeko.net',
-	'https://invidious.nerdvpn.de',
 	'https://yewtu.be',
-	'https://invidious.fdn.fr'
+	'https://inv.nadeko.net',
+	'https://invidious.nerdvpn.de'
 ];
 
 export const PIPED = [
